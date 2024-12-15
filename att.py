@@ -10,9 +10,9 @@ This code was heavily adapted from Graph Transformer
 https://github.com/lucidrains/graph-transformer-pytorch
 """
 import torch
-from torch import nn, einsum
+from torch import nn
 from torch_geometric.nn import Sequential
-from einops import rearrange, repeat
+from einops import rearrange, repeat, einsum
 
 # helpers
 
@@ -47,7 +47,7 @@ class GatedResidual(nn.Module):
 
 class Attention(nn.Module):
 
-    def __init__(self, dim, dim_head=64, heads=8, edge_dim=None, edge_out_dim=None):
+    def __init__(self, dim, dim_head=64, heads=8, edge_dim=None, edge_out_dim=None, alpha=0.8):
         super().__init__()
         # fundamental change: consider edges separately
         # TODO argument for dropping edges at the final layer such that we don't compute edge values their values for node prediction
@@ -59,17 +59,31 @@ class Attention(nn.Module):
         self.heads = heads
         self.scale = dim_head**-0.5
 
+        # node qkv
         self.to_q = nn.Linear(dim, inner_dim)
         self.to_k = nn.Linear(dim, inner_dim)
         self.to_v = nn.Linear(dim, inner_dim)
-        self.e_to_q = nn.Linear(edge_dim, inner_dim)
-        self.e_to_k = nn.Linear(edge_dim, inner_dim)
-        self.e_to_v = nn.Linear(edge_dim, inner_dim)
+
+        # edge qkv, separated for implementation of prior
+        self.e_to_q_uv = nn.Linear(2 * dim, inner_dim)
+        self.e_to_k_uv = nn.Linear(2 * dim, inner_dim)
+        self.e_to_v_uv = nn.Linear(2 * dim, inner_dim)
+        self.e_to_q_w = nn.Linear(edge_dim - 2 * dim, inner_dim)
+        self.e_to_k_w = nn.Linear(edge_dim - 2 * dim, inner_dim)
+        self.e_to_v_w = nn.Linear(edge_dim - 2 * dim, inner_dim)
 
         self.to_out = nn.Linear(inner_dim, dim)
         self.e_to_out = nn.Linear(inner_dim, edge_out_dim)
+        self.alpha = 0.8
+    
+    def prepare_edges(self, nodes, edge_index):
+        # TODO deal with batching properly
+        # TODO deal with edge_feature dimensionality possibly being different at each layer (i.e. being 0 in layer 0) but nonzero later
+        # TODO option to not output edges in the final layer
+        edges = rearrange(nodes.view(nodes.size()[1:])[edge_index], 'n e d -> 1 e (n d)')
+        return edges
 
-    def forward(self, nodes, edges, mask=None):
+    def forward(self, nodes, edge_features, edge_index, mask=None):
         """
         nodes: array[batch, nodes, dim]
         edges: array[batch, edges, edge_dim]
@@ -80,9 +94,26 @@ class Attention(nn.Module):
         k = self.to_k(nodes)
         v = self.to_v(nodes)
 
-        e_q = self.e_to_q(edges)
-        e_k = self.e_to_k(edges)
-        e_v = self.e_to_v(edges)
+        edges = self.prepare_edges(nodes, edge_index)
+
+        # impose prior to aid learning
+        e_q_uv = self.e_to_q_uv(edges)
+        e_k_uv = self.e_to_k_uv(edges)
+        e_v_uv = self.e_to_v_uv(edges)
+
+        e_q = (1 - self.alpha) * e_q_uv + self.alpha * einsum(q[:, edge_index], 'b e n d -> b n d')
+        e_k = (1 - self.alpha) * e_k_uv + self.alpha * einsum(k[:, edge_index], 'b e n d -> b n d')
+        e_v = (1 - self.alpha) * e_v_uv + self.alpha * einsum(v[:, edge_index], 'b e n d -> b n d')
+
+        if exists(edge_features):
+            e_q = e_q + self.e_to_k_w(edge_features)
+            e_k = e_k + self.e_to_v_w(edge_features)
+            e_v = e_v + self.e_to_q_w(edge_features)
+
+        # normalise to preserve magnitude of input signals
+        e_q *= nodes.size(-1) ** 0.5 / edges.size(-1) ** 0.5
+        e_k *= nodes.size(-1) ** 0.5 / edges.size(-1) ** 0.5
+        e_v *= nodes.size(-1) ** 0.5 / edges.size(-1) ** 0.5
 
         q, k, v, e_q, e_k, e_v = map(
             lambda t: rearrange(t, 'b ... (h d) -> (b h) ... d', h=h),
@@ -95,7 +126,7 @@ class Attention(nn.Module):
         k = torch.cat((k, e_k), dim=2)
         v = torch.cat((v, e_v), dim=2)
 
-        sim = einsum('b i d, b i j d -> b i j', q, k) * self.scale
+        sim = einsum(q, k, 'b i d, b i j d -> b i j') * self.scale
 
         # TODO mask will have incorrect dimensionality
         if exists(mask):
@@ -106,7 +137,7 @@ class Attention(nn.Module):
             sim.masked_fill_(~mask, max_neg_value)
 
         attn = sim.softmax(dim=-1)
-        out = einsum('b i j, b i j d -> b i d', attn, v)
+        out = einsum(attn, v, 'b i j, b i j d -> b i d')
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         out, e_out = out.split([nodes.size(1), edges.size(1)], dim=1)
         return self.to_out(out), self.e_to_out(e_out)
@@ -135,7 +166,8 @@ class GraphTransformer(nn.Module):
                  with_feedforwards=False,
                  norm_edges=False,
                  ff_mult=4,
-                 accept_adjacency_matrix=False):
+                 accept_adjacency_matrix=False,
+                 alpha=0.8):
         super().__init__()
         self.layers = List([])
         edge_dim = default(edge_dim, 0)
@@ -147,12 +179,12 @@ class GraphTransformer(nn.Module):
                         'n_f, e_f, idx',
                         [(nn.LayerNorm(dim), 'n_f -> n'),
                          (nn.LayerNorm(edge_dim) if edge_dim else lambda e_f: e_f, 'e_f -> e'),
-                         (self.prepare_edges, 'n, e, idx -> e'),
                          (Attention(dim,
                                     edge_dim=edge_dim + 2 * dim,
                                     edge_out_dim=edge_dim,
                                     dim_head=dim_head,
-                                    heads=heads), 'n, e -> n, e'),
+                                    heads=heads,
+                                    alpha=alpha), 'n, e, idx -> n, e'),
                          (GatedResidual(dim), 'n, n_f -> n'),
                          (GatedResidual(edge_dim) if edge_dim else lambda e, e_f: e, 'e, e_f -> e'),
                          (lambda n, e: (n, e), 'n, e -> n, e')],
@@ -166,15 +198,6 @@ class GraphTransformer(nn.Module):
                                         (lambda n, e: (n, e), 'n, e -> n, e')])
                     if with_feedforwards else None
                 ]))
-    
-    def prepare_edges(self, nodes, edge_features, edge_index):
-        # TODO deal with batching properly
-        # TODO deal with edge_feature dimensionality possibly being different at each layer (i.e. being 0 in layer 0) but nonzero later
-        # TODO option to not output edges in the final layer
-        edges = rearrange(nodes.view(nodes.size()[1:])[edge_index], 'n e d -> 1 e (n d)')
-        if exists(edge_features):
-            edges = torch.cat((edges, edge_features), dim=-1)
-        return edges
 
     def forward(self, nodes, edge_index, edge_features=None, mask=None):
         # nodes = rearrange(nodes, 'n d -> 1 n d')
