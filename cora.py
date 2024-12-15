@@ -13,44 +13,57 @@ experiment = typer.Typer(pretty_exceptions_show_locals=False)
 class Classifier(nn.Module):
     def __init__(self):
         super().__init__()
+        hid_dim = 32
+        self.embedder = nn.Linear(1433, hid_dim)
         self.model = GraphTransformer(
-            dim=1433,
+            dim=hid_dim,
             depth=1,
             dim_head=8,
-            heads=8,
+            heads=4,
             gated_residual=True,
             with_feedforwards=True,
-            norm_edges=False,
+            ff_mult=4,
+            norm_edges=True,
             accept_adjacency_matrix=False,
         )
-        self.classifier = nn.Linear(1433, 7)
+        self.classifier = nn.Linear(hid_dim, 7)
     
-    def forward(self, nodes, edges):
-        nodes, edges = self.model(nodes, edges)
+    def forward(self, nodes, edge_index):
+        nodes = self.embedder(nodes)
+        nodes, edges = self.model(nodes, edge_index)
         return self.classifier(nodes)
 
-    def get_loss(self, nodes, edges, labels, mask):
-        logits = self(nodes, edges)[mask]
-        labels = labels[mask]
-        loss = F.cross_entropy(logits, labels)
-        accuracy = (logits.argmax(-1) == labels).count_nonzero() / labels.numel()
-        return loss, accuracy
+    def get_loss(self, nodes, edge_index, labels, train_mask, val_mask):
+        logits = self(nodes, edge_index)
+        train_logits = logits[train_mask]
+        val_logits = logits[val_mask]
+        train_labels = labels[train_mask]
+        val_labels = labels[val_mask]
+
+        loss = F.cross_entropy(train_logits, train_labels)
+        with torch.no_grad():
+            train_acc = (train_logits.argmax(-1) == train_labels).count_nonzero() / train_labels.numel()
+            val_acc = (val_logits.argmax(-1) == val_labels).count_nonzero() / val_labels.numel()
+
+        return loss, train_acc, val_acc
     
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr = 0.01, weight_decay=0.1)
+        return torch.optim.Adam(self.parameters(), lr = 0.01)
 
 
-def train(model, dataset, max_epochs=1):
+def train(model, dataset, max_epochs=1, size=100000):
     optim = model.configure_optimizers()
-    nodes = dataset.x
-    edges = rearrange(nodes[dataset.edge_index], 'n e d -> 1 e (n d)')
+    nodes = dataset.x[:size]
+    edge_index = dataset.edge_index[:, (dataset.edge_index < size).all(0)]
     nodes = nodes.unsqueeze(0)
-    labels = dataset.y.unsqueeze(0)
-    mask = dataset.train_mask.unsqueeze(0)
+    labels = dataset.y[:size].unsqueeze(0)
+    train_mask = dataset.train_mask[:size].unsqueeze(0)
+    val_mask = dataset.val_mask[:size].unsqueeze(0)
     model.train()
-    for epoch in trange(max_epochs):
+    for epoch in range(max_epochs):
         optim.zero_grad()
-        loss, acc = model.get_loss(nodes, edges, labels, mask)
+        loss, train_acc, val_acc = model.get_loss(nodes, edge_index, labels, train_mask, val_mask)
+        print(f'{epoch}/{max_epochs} loss={round(loss.item(), 2)} train_acc={round(train_acc.item(), 3)} val_acc={round(val_acc.item(), 3)}')
         loss.backward()
         optim.step()
     model.eval()
@@ -59,6 +72,11 @@ def train(model, dataset, max_epochs=1):
 @experiment.command()
 def main():
     model = Classifier()
+    param_size = 0
+    with torch.no_grad():
+        for name, w in model.named_parameters():
+            param_size += w.nelement()
+    print(param_size)
     dataset = datasets.Planetoid(
             root="~/data",
             name='Cora',
@@ -66,7 +84,7 @@ def main():
             transform=torch_geometric.transforms.GCNNorm()
         )
 
-    train(model, dataset, max_epochs=1)
+    train(model, dataset, max_epochs=50, size=2708)
 
 
 if __name__ == '__main__':
