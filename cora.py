@@ -6,25 +6,26 @@ import torch_geometric
 from einops import rearrange
 import torch
 from tqdm import trange
+import optuna
 from att import GraphTransformer
 import typer
 experiment = typer.Typer(pretty_exceptions_show_locals=False)
 
 class Classifier(nn.Module):
-    def __init__(self):
+    def __init__(self, hid_dim=16, depth=3, dim_head=8, heads=4, alpha=0.9, ff_mult=4):
         super().__init__()
-        hid_dim = 32
         self.embedder = nn.Linear(1433, hid_dim)
         self.model = GraphTransformer(
             dim=hid_dim,
-            depth=1,
-            dim_head=8,
-            heads=4,
+            depth=depth,
+            dim_head=dim_head,
+            heads=heads,
             gated_residual=True,
-            with_feedforwards=True,
-            ff_mult=4,
+            with_feedforwards=False,
+            ff_mult=ff_mult,
             norm_edges=True,
             accept_adjacency_matrix=False,
+            alpha=alpha,
         )
         self.classifier = nn.Linear(hid_dim, 7)
     
@@ -48,10 +49,10 @@ class Classifier(nn.Module):
         return loss, train_acc, val_acc
     
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr = 0.01)
+        return torch.optim.Adam(self.parameters(), lr = 0.01, weight_decay=0.00001)
 
 
-def train(model, dataset, max_epochs=1, size=100000):
+def train(model, dataset, max_epochs=1, size=100000, log=True):
     optim = model.configure_optimizers()
     nodes = dataset.x[:size]
     edge_index = dataset.edge_index[:, (dataset.edge_index < size).all(0)]
@@ -60,16 +61,20 @@ def train(model, dataset, max_epochs=1, size=100000):
     train_mask = dataset.train_mask[:size].unsqueeze(0)
     val_mask = dataset.val_mask[:size].unsqueeze(0)
     model.train()
+    val_accs = []
     for epoch in range(max_epochs):
         optim.zero_grad()
         loss, train_acc, val_acc = model.get_loss(nodes, edge_index, labels, train_mask, val_mask)
-        print(f'{epoch}/{max_epochs} loss={round(loss.item(), 2)} train_acc={round(train_acc.item(), 3)} val_acc={round(val_acc.item(), 3)}')
+        if log is True:
+            print(f'{epoch}/{max_epochs} loss={round(loss.item(), 2)} train_acc={round(train_acc.item(), 3)} val_acc={round(val_acc.item(), 3)}')
+        val_accs.append(round(val_acc.item(), 3))
         loss.backward()
         optim.step()
     model.eval()
 
+    return max(val_accs)
 
-@experiment.command()
+
 def main():
     model = Classifier()
     param_size = 0
@@ -84,7 +89,41 @@ def main():
             transform=torch_geometric.transforms.GCNNorm()
         )
 
-    train(model, dataset, max_epochs=50, size=2708)
+    train(model, dataset, max_epochs=50, size=2000)
+
+
+dataset = datasets.Planetoid(
+            root="~/data",
+            name='Cora',
+            split="public",
+            transform=torch_geometric.transforms.GCNNorm()
+        )
+
+def objective(trial):
+    hid_dim = trial.suggest_int('hid_dim', 2, 32, log=True)
+    depth = trial.suggest_int('depth', 1, 4)
+    dim_head = trial.suggest_int('dim_head', 1, 16)
+    heads = trial.suggest_int('heads', 1, 8)
+    ff_mult = trial.suggest_int('ff_mult', 1, 4)
+    alpha = trial.suggest_float('alpha', 0.0, 1.0)
+
+    model = Classifier(
+        hid_dim=hid_dim,
+        depth=depth,
+        dim_head=dim_head,
+        heads=heads,
+        ff_mult=ff_mult,
+        alpha=alpha,
+    )
+    return train(model, dataset, max_epochs=50, size=1000, log=False)
+
+
+@experiment.command()
+def hyperparam_search():
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=100)
+    print(f'best_params: {study.best_params}')
+    print(f'importances: {optuna.importance.get_param_importances(study)}')
 
 
 if __name__ == '__main__':
