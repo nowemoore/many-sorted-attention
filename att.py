@@ -47,11 +47,12 @@ class GatedResidual(nn.Module):
 
 class Attention(nn.Module):
 
-    def __init__(self, dim, dim_head=64, heads=8, edge_dim=None):
+    def __init__(self, dim, dim_head=64, heads=8, edge_dim=None, edge_out_dim=None):
         super().__init__()
         # fundamental change: consider edges separately
         # TODO argument for dropping edges at the final layer such that we don't compute edge values their values for node prediction
         edge_dim = default(edge_dim, 2 * dim)
+        edge_out_dim = default(edge_out_dim, dim)
         assert edge_dim >= 2 * dim, 'edges must contain both adjacent node features: so edge_dim >= 2 * dim'
 
         inner_dim = dim_head * heads
@@ -66,7 +67,7 @@ class Attention(nn.Module):
         self.e_to_v = nn.Linear(edge_dim, inner_dim)
 
         self.to_out = nn.Linear(inner_dim, dim)
-        self.e_to_out = nn.Linear(inner_dim, edge_dim)
+        self.e_to_out = nn.Linear(inner_dim, edge_out_dim)
 
     def forward(self, nodes, edges, mask=None):
         """
@@ -133,54 +134,57 @@ class GraphTransformer(nn.Module):
                  gated_residual=True,
                  with_feedforwards=False,
                  norm_edges=False,
+                 ff_mult=4,
                  accept_adjacency_matrix=False):
         super().__init__()
         self.layers = List([])
-        edge_dim = default(edge_dim, 2 * dim)
-        assert edge_dim >= 2 * dim, 'edges must contain both adjacent node features: so edge_dim >= 2 * dim'
-        self.norm_edges = nn.LayerNorm(
-            edge_dim) if norm_edges else nn.Identity()
+        edge_dim = default(edge_dim, 0)
 
         for _ in range(depth):
             self.layers.append(
                 List([
                     Sequential(
-                        'n0, e0',
-                        [(nn.LayerNorm(dim), 'n0 -> n'),
-                         (nn.LayerNorm(edge_dim), 'e0 -> e'),
+                        'n_f, e_f, idx',
+                        [(nn.LayerNorm(dim), 'n_f -> n'),
+                         (nn.LayerNorm(edge_dim) if edge_dim else lambda e_f: e_f, 'e_f -> e'),
+                         (self.prepare_edges, 'n, e, idx -> e'),
                          (Attention(dim,
-                                    edge_dim=edge_dim,
+                                    edge_dim=edge_dim + 2 * dim,
+                                    edge_out_dim=edge_dim,
                                     dim_head=dim_head,
                                     heads=heads), 'n, e -> n, e'),
-                         (GatedResidual(dim), 'n, n0 -> n'),
-                         (GatedResidual(edge_dim), 'e, e0 -> e'),
+                         (GatedResidual(dim), 'n, n_f -> n'),
+                         (GatedResidual(edge_dim) if edge_dim else lambda e, e_f: e, 'e, e_f -> e'),
                          (lambda n, e: (n, e), 'n, e -> n, e')],
                     ),
-                    Sequential('n, e', [(nn.LayerNorm(dim), 'n0 -> n'),
-                                        (FeedForward(dim), 'n -> n'),
+                    Sequential('n0, e0', [(nn.LayerNorm(dim), 'n0 -> n'),
+                                        (FeedForward(dim, ff_mult), 'n -> n'),
                                         (GatedResidual(dim), 'n, n0 -> n'),
-                                        (nn.LayerNorm(dim), 'e0 -> e'),
-                                        (FeedForward(dim), 'e -> e'),
-                                        (GatedResidual(dim), 'e, e0 -> e'),
+                                        (nn.LayerNorm(edge_dim) if norm_edges else lambda x: x, 'e0 -> e'),
+                                        (FeedForward(edge_dim, ff_mult), 'e -> e'),
+                                        (GatedResidual(edge_dim), 'e, e0 -> e'),
                                         (lambda n, e: (n, e), 'n, e -> n, e')])
                     if with_feedforwards else None
                 ]))
+    
+    def prepare_edges(self, nodes, edge_features, edge_index):
+        # TODO deal with batching properly
+        # TODO deal with edge_feature dimensionality possibly being different at each layer (i.e. being 0 in layer 0) but nonzero later
+        # TODO option to not output edges in the final layer
+        edges = rearrange(nodes.view(nodes.size()[1:])[edge_index], 'n e d -> 1 e (n d)')
+        if exists(edge_features):
+            edges = torch.cat((edges, edge_features), dim=-1)
+        return edges
 
-    def forward(self, nodes, edges=None, adj_mat=None, mask=None):
-        batch, seq, _ = nodes.shape
-
-        if exists(adj_mat):
-            assert not exists(edges)
-            assert adj_mat.shape == (batch, seq, seq)
-            # edges = {[n(u), n(v)] | adj_mat[u, v] = 1}
-            edges = nodes[torch.argwhere(adj_matrix)].flatten(-2, -1)
-
-        edges = self.norm_edges(edges)
+    def forward(self, nodes, edge_index, edge_features=None, mask=None):
+        # nodes = rearrange(nodes, 'n d -> 1 n d')
+        if exists(edge_features):
+            edge_features = rearrange(edge_features, 'e d -> 1 e d')
 
         for attn_block, ff_block in self.layers:
-            nodes, edges = attn_block(nodes, edges)
+            nodes, edge_features = attn_block(nodes, edge_features, edge_index)
 
             if exists(ff_block):
-                nodes, edges = ff_block(nodes, edges)
+                nodes, edge_features = ff_block(nodes, edge_features)
 
-        return nodes, edges
+        return nodes, edge_features
