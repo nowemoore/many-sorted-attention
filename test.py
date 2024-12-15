@@ -25,6 +25,7 @@ if __name__ == '__main__':
     )
 
     nodes, edges = model(
-        torch.randn(3, 10, 8),
-        torch.randn(3, 23, 18),
+        torch.randn(10, 8),
+        edge_index=torch.randint(0, 10, (2, 23)),
+        edge_features=torch.randn(23, 18),
     )
