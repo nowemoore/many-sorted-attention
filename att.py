@@ -103,9 +103,9 @@ class Attention(nn.Module):
 
         # TODO which way around should it be? Do we just want to impose a restriction on the key? on the query? the value? all 3?
 
-        e_q = (1 - self.alpha) * e_q_uv + self.alpha * einsum(k[:, edge_index], 'b e n d -> b n d')
-        e_k = (1 - self.alpha) * e_k_uv + self.alpha * einsum(q[:, edge_index], 'b e n d -> b n d')
-        e_v = (1 - self.alpha) * e_v_uv + self.alpha * einsum(v[:, edge_index], 'b e n d -> b n d')
+        e_q = (1 - self.alpha) * 2 ** 0.5 * e_q_uv + self.alpha * einsum(k[:, edge_index], 'b e n d -> b n d')
+        e_k = (1 - self.alpha) * 2 ** 0.5 * e_k_uv + self.alpha * einsum(q[:, edge_index], 'b e n d -> b n d')
+        e_v = (1 - self.alpha) * 2 ** 0.5 * e_v_uv + self.alpha * einsum(v[:, edge_index], 'b e n d -> b n d')
 
         if exists(edge_features):
             e_q = e_q + self.e_to_k_w(edge_features)
