@@ -21,7 +21,7 @@ class Classifier(nn.Module):
             dim_head=dim_head,
             heads=heads,
             gated_residual=True,
-            with_feedforwards=False,
+            with_feedforwards=True,
             ff_mult=ff_mult,
             norm_edges=True,
             accept_adjacency_matrix=False,
@@ -100,7 +100,7 @@ dataset = datasets.Planetoid(
         )
 
 def objective(trial):
-    hid_dim = trial.suggest_int('hid_dim', 2, 32, log=True)
+    hid_dim = trial.suggest_int('hid_dim', 16, 32, log=True)
     depth = trial.suggest_int('depth', 1, 4)
     dim_head = trial.suggest_int('dim_head', 1, 16)
     heads = trial.suggest_int('heads', 1, 8)
