@@ -47,7 +47,13 @@ class GatedResidual(nn.Module):
 
 class Attention(nn.Module):
 
-    def __init__(self, dim, dim_head=64, heads=8, edge_dim=None, edge_out_dim=None, alpha=0.8):
+    def __init__(self,
+                 dim,
+                 dim_head=64,
+                 heads=8,
+                 edge_dim=None,
+                 edge_out_dim=None,
+                 alpha=0.8):
         super().__init__()
         # fundamental change: consider edges separately
         # TODO argument for dropping edges at the final layer such that we don't compute edge values their values for node prediction
@@ -75,12 +81,13 @@ class Attention(nn.Module):
         self.to_out = nn.Linear(inner_dim, dim)
         self.e_to_out = nn.Linear(inner_dim, edge_out_dim)
         self.alpha = 0.8
-    
+
     def prepare_edges(self, nodes, edge_index):
         # TODO deal with batching properly
         # TODO deal with edge_feature dimensionality possibly being different at each layer (i.e. being 0 in layer 0) but nonzero later
         # TODO option to not output edges in the final layer
-        edges = rearrange(nodes.view(nodes.size()[1:])[edge_index], 'n e d -> 1 e (n d)')
+        edges = rearrange(
+            nodes.view(nodes.size()[1:])[edge_index], 'n e d -> 1 e (n d)')
         return edges
 
     def forward(self, nodes, edge_features, edge_index, mask=None):
@@ -103,9 +110,12 @@ class Attention(nn.Module):
 
         # TODO which way around should it be? Do we just want to impose a restriction on the key? on the query? the value? all 3?
 
-        e_q = (1 - self.alpha) * 2 ** 0.5 * e_q_uv + self.alpha * einsum(k[:, edge_index], 'b e n d -> b n d')
-        e_k = (1 - self.alpha) * 2 ** 0.5 * e_k_uv + self.alpha * einsum(q[:, edge_index], 'b e n d -> b n d')
-        e_v = (1 - self.alpha) * 2 ** 0.5 * e_v_uv + self.alpha * einsum(v[:, edge_index], 'b e n d -> b n d')
+        e_q = (1 - self.alpha) * 2**0.5 * e_q_uv + self.alpha * einsum(
+            k[:, edge_index], 'b e n d -> b n d')
+        e_k = (1 - self.alpha) * 2**0.5 * e_k_uv + self.alpha * einsum(
+            q[:, edge_index], 'b e n d -> b n d')
+        e_v = (1 - self.alpha) * 2**0.5 * e_v_uv + self.alpha * einsum(
+            v[:, edge_index], 'b e n d -> b n d')
 
         if exists(edge_features):
             e_q = e_q + self.e_to_k_w(edge_features)
@@ -113,9 +123,9 @@ class Attention(nn.Module):
             e_v = e_v + self.e_to_q_w(edge_features)
 
         # normalise to preserve magnitude of input signals
-        e_q *= nodes.size(-1) ** 0.5 / edges.size(-1) ** 0.5
-        e_k *= nodes.size(-1) ** 0.5 / edges.size(-1) ** 0.5
-        e_v *= nodes.size(-1) ** 0.5 / edges.size(-1) ** 0.5
+        e_q *= nodes.size(-1)**0.5 / edges.size(-1)**0.5
+        e_k *= nodes.size(-1)**0.5 / edges.size(-1)**0.5
+        e_v *= nodes.size(-1)**0.5 / edges.size(-1)**0.5
 
         q, k, v, e_q, e_k, e_v = map(
             lambda t: rearrange(t, 'b ... (h d) -> (b h) ... d', h=h),
@@ -174,32 +184,45 @@ class GraphTransformer(nn.Module):
         self.layers = List([])
         edge_dim = default(edge_dim, 0)
 
-        for _ in range(depth):
+        for layer in range(depth):
             self.layers.append(
                 List([
                     Sequential(
                         'n_f, e_f, idx',
                         [(nn.LayerNorm(dim), 'n_f -> n'),
-                         (nn.LayerNorm(edge_dim) if edge_dim else lambda e_f: e_f, 'e_f -> e'),
+                         (nn.LayerNorm(edge_dim)
+                          if edge_dim else lambda e_f: e_f, 'e_f -> e'),
                          (Attention(dim,
                                     edge_dim=edge_dim + 2 * dim,
                                     edge_out_dim=edge_dim,
                                     dim_head=dim_head,
                                     heads=heads,
-                                    alpha=alpha), 'n, e, idx -> n, e'),
+                                    alpha=alpha,
+                                    out_edges=layer == depth - 1),
+                          ('n, e, idx -> n, e') if layer != depth - 1 else
+                          ('n, e, idx -> n')),
                          (GatedResidual(dim), 'n, n_f -> n'),
-                         (GatedResidual(edge_dim) if edge_dim else lambda e, e_f: e, 'e, e_f -> e'),
-                         (lambda n, e: (n, e), 'n, e -> n, e')],
+                         *(((GatedResidual(edge_dim)
+                             if edge_dim else lambda e, e_f: e, 'e, e_f -> e'),
+                            (lambda n, e: (n, e),
+                             'n, e -> n, e')) if layer != depth - 1 else
+                           (lambda n: n, 'n -> n'))],
                     ),
-                    Sequential('n0, e0', [(nn.LayerNorm(dim), 'n0 -> n'),
-                                        (FeedForward(dim, ff_mult), 'n -> n'),
-                                        (GatedResidual(dim), 'n, n0 -> n'),
-                                        (nn.LayerNorm(edge_dim) if norm_edges else lambda x: x, 'e0 -> e'),
-                                        (FeedForward(edge_dim, ff_mult), 'e -> e'),
-                                        (GatedResidual(edge_dim), 'e, e0 -> e'),
-                                        (lambda n, e: (n, e), 'n, e -> n, e')])
-                    if with_feedforwards else None
+                    Sequential('n0, e0', [
+                        (nn.LayerNorm(dim), 'n0 -> n'),
+                        (FeedForward(dim, ff_mult), 'n -> n'),
+                        (GatedResidual(dim), 'n, n0 -> n'),
+                        *(((nn.LayerNorm(edge_dim)
+                            if norm_edges else lambda x: x, 'e0 -> e'),
+                           (FeedForward(edge_dim, ff_mult), 'e -> e'),
+                           (GatedResidual(edge_dim), 'e, e0 -> e'),
+                           (lambda n, e:
+                            (n, e), 'n, e -> n, e')) if layer != depth - 1 else
+                          (lambda n: n, 'n -> n, e'))
+                    ]) if with_feedforwards else None
                 ]))
+
+        self.classifier = nn.Linear(dim, out_dim)
 
     def forward(self, nodes, edge_index, edge_features=None, mask=None):
         # nodes = rearrange(nodes, 'n d -> 1 n d')
@@ -210,6 +233,7 @@ class GraphTransformer(nn.Module):
             nodes, edge_features = attn_block(nodes, edge_features, edge_index)
 
             if exists(ff_block):
+                # Note: in the last layer ff_block computes identity for edge_features
                 nodes, edge_features = ff_block(nodes, edge_features)
 
-        return nodes, edge_features
+        return self.classifier(nodes)
