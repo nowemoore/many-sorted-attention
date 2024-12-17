@@ -6,7 +6,7 @@ from einops import rearrange
 import torch
 from tqdm import trange
 import optuna
-from att import GraphTransformer
+from att import TypedTransformer
 import typer
 
 experiment = typer.Typer(pretty_exceptions_show_locals=False)
@@ -16,6 +16,7 @@ class Classifier(nn.Module):
 
     def __init__(self,
                  hid_dim=16,
+                 out_dim=7,
                  depth=3,
                  dim_head=8,
                  heads=4,
@@ -23,7 +24,7 @@ class Classifier(nn.Module):
                  ff_mult=4):
         super().__init__()
         self.embedder = nn.Linear(1433, hid_dim)
-        self.model = GraphTransformer(
+        self.model = TypedTransformer(
             dim=hid_dim,
             depth=depth,
             dim_head=dim_head,
@@ -35,12 +36,10 @@ class Classifier(nn.Module):
             accept_adjacency_matrix=False,
             alpha=alpha,
         )
-        self.classifier = nn.Linear(hid_dim, 7)
 
     def forward(self, nodes, edge_index):
         nodes = self.embedder(nodes)
-        nodes, edges = self.model(nodes, edge_index)
-        return self.classifier(nodes)
+        return self.model(nodes, edge_index)
 
     def get_loss(self, nodes, edge_index, labels, train_mask, val_mask):
         logits = self(nodes, edge_index)
@@ -59,13 +58,16 @@ class Classifier(nn.Module):
         return loss, train_acc, val_acc
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(),
-                                lr=0.01,
-                                weight_decay=0.00001)
+        optimiser = torch.optim.Adam(self.parameters(),
+                                     lr=0.02,
+                                     weight_decay=0.00001)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer=optimiser, T_max=50)
+        return optimiser, scheduler
 
 
 def train(model, dataset, max_epochs=1, size=100000, log=True):
-    optim = model.configure_optimizers()
+    optim, scheduler = model.configure_optimizers()
     nodes = dataset.x[:size]
     edge_index = dataset.edge_index[:, (dataset.edge_index < size).all(0)]
     nodes = nodes.unsqueeze(0)
@@ -85,6 +87,7 @@ def train(model, dataset, max_epochs=1, size=100000, log=True):
         val_accs.append(round(val_acc.item(), 3))
         loss.backward()
         optim.step()
+        scheduler.step()
     model.eval()
 
     return max(val_accs)
@@ -131,12 +134,24 @@ def objective(trial):
     return train(model, dataset, max_epochs=50, size=2000, log=False)
 
 
-@experiment.command()
 def hyperparam_search():
     study = optuna.create_study(direction='maximize')
     study.optimize(objective, n_trials=3)
     print(f'best_params: {study.best_params}')
     print(f'importances: {optuna.importance.get_param_importances(study)}')
+
+
+@experiment.command()
+def test():
+    model = Classifier(
+        hid_dim=26,
+        depth=2,
+        dim_head=10,
+        heads=8,
+        # ff_mult=ff_mult,
+        alpha=0.2,
+    )
+    return train(model, dataset, max_epochs=50, size=2000)
 
 
 if __name__ == '__main__':
