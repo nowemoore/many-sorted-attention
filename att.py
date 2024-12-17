@@ -47,19 +47,23 @@ class GatedResidual(nn.Module):
 
 class Attention(nn.Module):
 
-    def __init__(self,
-                 dim,
-                 dim_head=64,
-                 heads=8,
-                 edge_dim=None,
-                 edge_out_dim=None,
-                 alpha=0.8):
+    def __init__(
+        self,
+        dim,
+        dim_head=64,
+        heads=8,
+        edge_dim=None,
+        edge_out_dim=None,
+        alpha=0.8,
+        out_edges=True,
+    ):
         super().__init__()
         # fundamental change: consider edges separately
         # TODO argument for dropping edges at the final layer such that we don't compute edge values their values for node prediction
         edge_dim = default(edge_dim, 2 * dim)
         edge_out_dim = default(edge_out_dim, dim)
         assert edge_dim >= 2 * dim, 'edges must contain both adjacent node features: so edge_dim >= 2 * dim'
+        self.out_edges = out_edges
 
         inner_dim = dim_head * heads
         self.heads = heads
@@ -79,7 +83,8 @@ class Attention(nn.Module):
         self.e_to_v_w = nn.Linear(edge_dim - 2 * dim, inner_dim)
 
         self.to_out = nn.Linear(inner_dim, dim)
-        self.e_to_out = nn.Linear(inner_dim, edge_out_dim)
+        if self.out_edges:
+            self.e_to_out = nn.Linear(inner_dim, edge_out_dim)
         self.alpha = 0.8
 
     def prepare_edges(self, nodes, edge_index):
@@ -152,7 +157,10 @@ class Attention(nn.Module):
         out = einsum(attn, v, 'b i j, b i j d -> b i d')
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         out, e_out = out.split([nodes.size(1), edges.size(1)], dim=1)
-        return self.to_out(out), self.e_to_out(e_out)
+        if self.out_edges:
+            return self.to_out(out), self.e_to_out(e_out)
+        else:
+            return self.to_out(out), None
 
 
 # optional feedforward
@@ -166,10 +174,11 @@ def FeedForward(dim, ff_mult=4):
 # classes
 
 
-class GraphTransformer(nn.Module):
+class TypedTransformer(nn.Module):
 
     def __init__(self,
                  dim,
+                 hid_dim,
                  depth,
                  dim_head=64,
                  edge_dim=None,
@@ -179,53 +188,61 @@ class GraphTransformer(nn.Module):
                  norm_edges=False,
                  ff_mult=4,
                  accept_adjacency_matrix=False,
-                 alpha=0.8):
+                 out_dim=None,
+                 alpha=0.8,
+                 agg=None):
         super().__init__()
         self.layers = List([])
         edge_dim = default(edge_dim, 0)
+        out_dim = default(out_dim, hid_dim)
+        assert agg in {None, 'mean'}
+        self.agg = agg
+
+        self.encoder = nn.Linear(dim, hid_dim)
 
         for layer in range(depth):
             self.layers.append(
                 List([
                     Sequential(
                         'n_f, e_f, idx',
-                        [(nn.LayerNorm(dim), 'n_f -> n'),
+                        [(nn.LayerNorm(hid_dim), 'n_f -> n'),
                          (nn.LayerNorm(edge_dim)
                           if edge_dim else lambda e_f: e_f, 'e_f -> e'),
-                         (Attention(dim,
-                                    edge_dim=edge_dim + 2 * dim,
+                         (Attention(hid_dim,
+                                    edge_dim=edge_dim + 2 * hid_dim,
                                     edge_out_dim=edge_dim,
                                     dim_head=dim_head,
                                     heads=heads,
                                     alpha=alpha,
-                                    out_edges=layer == depth - 1),
-                          ('n, e, idx -> n, e') if layer != depth - 1 else
-                          ('n, e, idx -> n')),
-                         (GatedResidual(dim), 'n, n_f -> n'),
-                         *(((GatedResidual(edge_dim)
-                             if edge_dim else lambda e, e_f: e, 'e, e_f -> e'),
-                            (lambda n, e: (n, e),
-                             'n, e -> n, e')) if layer != depth - 1 else
-                           (lambda n: n, 'n -> n'))],
+                                    out_edges=layer != depth - 1),
+                          ('n, e, idx -> n, e')),
+                         (GatedResidual(hid_dim), 'n, n_f -> n'),
+                         (GatedResidual(edge_dim) if edge_dim
+                          and layer != depth - 1 else lambda e, e_f: e,
+                          'e, e_f -> e'), (lambda n, e:
+                                           (n, e), 'n, e -> n, e')],
                     ),
                     Sequential('n0, e0', [
-                        (nn.LayerNorm(dim), 'n0 -> n'),
-                        (FeedForward(dim, ff_mult), 'n -> n'),
-                        (GatedResidual(dim), 'n, n0 -> n'),
+                        (nn.LayerNorm(hid_dim), 'n0 -> n'),
+                        (FeedForward(hid_dim, ff_mult), 'n -> n'),
+                        (GatedResidual(hid_dim), 'n, n0 -> n'),
                         *(((nn.LayerNorm(edge_dim)
                             if norm_edges else lambda x: x, 'e0 -> e'),
                            (FeedForward(edge_dim, ff_mult), 'e -> e'),
                            (GatedResidual(edge_dim), 'e, e0 -> e'),
                            (lambda n, e:
                             (n, e), 'n, e -> n, e')) if layer != depth - 1 else
-                          (lambda n: n, 'n -> n, e'))
+                          ((lambda n, e: (n, e), 'n, e0 -> n, e0'), ))
                     ]) if with_feedforwards else None
                 ]))
 
-        self.classifier = nn.Linear(dim, out_dim)
+        self.classifier = nn.Linear(hid_dim, out_dim)
 
     def forward(self, nodes, edge_index, edge_features=None, mask=None):
         # nodes = rearrange(nodes, 'n d -> 1 n d')
+        nodes = self.encoder(nodes)
+        if len(nodes.size()) == 2:
+            nodes = nodes.unsqueeze(0)
         if exists(edge_features):
             edge_features = rearrange(edge_features, 'e d -> 1 e d')
 
@@ -236,4 +253,11 @@ class GraphTransformer(nn.Module):
                 # Note: in the last layer ff_block computes identity for edge_features
                 nodes, edge_features = ff_block(nodes, edge_features)
 
-        return self.classifier(nodes)
+        match self.agg:
+            case None:  # for node classification
+                return self.classifier(nodes)
+            case 'mean':  # for graph classification
+                return self.classifier(nodes.mean(-2))
+            case _:
+                raise NotImplementedError(
+                    'This aggregation method is not implemented')
