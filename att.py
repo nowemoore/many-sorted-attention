@@ -150,7 +150,6 @@ class Attention(nn.Module):
             mask = rearrange(mask, 'b i -> b i ()') & rearrange(
                 mask, 'b j -> b () j')
             mask = repeat(mask, 'b i j -> (b h) i j', h=h)
-            max_neg_value = -torch.finfo(sim.dtype).max
             sim.masked_fill_(~mask, max_neg_value)
 
         attn = sim.softmax(dim=-1)

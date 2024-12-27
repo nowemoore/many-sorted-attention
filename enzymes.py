@@ -38,43 +38,44 @@ def train(model, dataloader, max_epochs=50, log=True):
 
             loss = 0
             acc = 0
-            for j, (x, y, edge_index) in enumerate(zip(xs, ys.unsqueeze(1), edge_indices)):
+            for j, (x, y, edge_index) in enumerate(
+                    zip(xs, ys.unsqueeze(1), edge_indices)):
                 logits = model(nodes=x,
-                               edge_index=edge_index - batch.ptr[j] - (0 if j == 0 else 1),
+                               edge_index=edge_index - batch.ptr[j] -
+                               (0 if j == 0 else 1),
                                edge_features=torch.zeros(
                                    edge_index.size(1), 0))
                 loss += F.cross_entropy(logits, y) / ys.size(0)
-                acc += (logits.argmax(-1)
-                        == y).count_nonzero() / ys.size(0)
+                acc += (logits.argmax(-1) == y).count_nonzero() / ys.size(0)
             loss.backward()
             optimiser.step()
             losses.append(loss.item())
             accs.append(acc.item())
         if log:
-            print(f'{epoch=}/{max_epochs} loss={round(sum(losses) / len(losses), 3)} acc={round(sum(accs) / len(accs), 3)}')
+            print(
+                f'{epoch=}/{max_epochs} loss={round(sum(losses) / len(losses), 3)} acc={round(sum(accs) / len(accs), 3)}'
+            )
 
 
 @experiment.command()
 def main():
     dataset = TUDataset(root='~/data', name='ENZYMES')
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
 
-    model = TypedTransformer(
-        dim=3,
-        hid_dim=6,
-        out_dim=6,
-        depth=1,
-        dim_head=8,
-        edge_dim=0,
-        heads=4,
-        gated_residual=True,
-        with_feedforwards=True,
-        norm_edges=False,
-        ff_mult=4,
-        alpha=0.4,
-        agg='mean'
-    )
-    train(model, dataloader)
+    model = TypedTransformer(dim=3,
+                             hid_dim=6,
+                             out_dim=6,
+                             depth=1,
+                             dim_head=8,
+                             edge_dim=0,
+                             heads=4,
+                             gated_residual=True,
+                             with_feedforwards=True,
+                             norm_edges=False,
+                             ff_mult=4,
+                             alpha=0.4,
+                             agg='mean')
+    train(model, dataloader, max_epochs=100)
 
 
 if __name__ == '__main__':
